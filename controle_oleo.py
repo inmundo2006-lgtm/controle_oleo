@@ -67,13 +67,18 @@ def obter_token():
 def obter_dados_sharepoint(token, lista_id):
     url = (
         f"{GRAPH_URL}/sites/{SITE_ID}/lists/{lista_id}/items"
-        f"?expand=fields&$orderby=fields/Created desc&$top=2000"
+        f"?expand=fields&$top=2000"
     )
     headers = {"Authorization": f"Bearer {token}"}
     try:
         r = requests.get(url, headers=headers)
-        return [item["fields"] for item in r.json().get("value", [])]
-    except:
+        if not r.ok:
+            st.error(f"Erro Graph API ({r.status_code}): {r.text[:300]}")
+            return []
+        dados = r.json().get("value", [])
+        return [item["fields"] for item in dados]
+    except Exception as e:
+        st.error(f"Erro ao buscar dados: {e}")
         return []
 
 
