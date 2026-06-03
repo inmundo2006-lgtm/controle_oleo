@@ -404,6 +404,12 @@ dados_sp = obter_dados_sharepoint(token, LISTA_ID)
 df = preparar_dataframe(dados_sp)
 saldos = calcular_saldos(df)
 
+# DEBUG TEMPORÁRIO
+if dados_sp:
+    with st.expander("🔍 DEBUG — campos retornados pelo SharePoint"):
+        st.write("Chaves:", list(dados_sp[0].keys()))
+        st.write("Valores:", dados_sp[0])
+
 # ── SIDEBAR ────────────────────────────────────────────
 with st.sidebar:
     if os.path.exists(ARQUIVO_LOGO):
