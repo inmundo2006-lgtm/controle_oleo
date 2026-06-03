@@ -44,7 +44,7 @@ TIPOS_OLEO = {
 # ==========================
 # FUNÇÕES AUTH GRAPH
 # ==========================
-@st.cache_data(ttl=60)
+@st.cache_data(ttl=55)
 def obter_token():
     url = f"https://login.microsoftonline.com/{TENANT_ID}/oauth2/v2.0/token"
     payload = {
@@ -125,15 +125,18 @@ def preparar_dataframe(dados_sp):
     df["Data_Dt"] = dt_local.dt.date
     df["Hora"] = dt_local.dt.strftime("%H:%M")
     df["Quantidade"] = pd.to_numeric(df["Quantidade"], errors="coerce").fillna(0)
+    # normaliza strings para evitar problemas de espaço/encoding
+    df["Tipo_Oleo"]      = df["Tipo_Oleo"].astype(str).str.strip()
+    df["Tipo_Operacao"]  = df["Tipo_Operacao"].astype(str).str.strip()
     return df
 
 
 def calcular_saldos(df):
     saldos = {}
     for tipo in TIPOS_OLEO:
-        df_t = df[df["Tipo_Oleo"] == tipo]
-        ent = df_t[df_t["Tipo_Operacao"] == "Entrada"]["Quantidade"].sum()
-        sai = df_t[df_t["Tipo_Operacao"] == "Saida"]["Quantidade"].sum()
+        df_t = df[df["Tipo_Oleo"].str.strip() == tipo.strip()]
+        ent = df_t[df_t["Tipo_Operacao"].str.strip() == "Entrada"]["Quantidade"].sum()
+        sai = df_t[df_t["Tipo_Operacao"].str.strip() == "Saida"]["Quantidade"].sum()
         saldos[tipo] = ent - sai
     return saldos
 
