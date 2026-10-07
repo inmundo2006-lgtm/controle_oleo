@@ -5,7 +5,8 @@ from datetime import datetime, timezone, timedelta
 import time
 import os
 import re
-from io import BytesIO
+
+from relatorio_pdf import gerar_pdf
 
 # ==========================
 # CONFIGURAÇÕES
@@ -186,40 +187,15 @@ def calcular_saldos(df):
     return saldos
 
 
-def gerar_excel(tabela):
-    """.xlsx do relatório: aba Lançamentos (a tabela da tela) e aba Resumo saídas (litros por frente e tipo)."""
-    from openpyxl.utils import get_column_letter
-
-    def formatar(ws, df, larguras):
-        for i, col in enumerate(df.columns, start=1):
-            letra = get_column_letter(i)
-            ws.column_dimensions[letra].width = larguras.get(col, 14)
-            formato = "DD/MM/YYYY" if col == "Data" else "#,##0.0" if df[col].dtype.kind in "fi" else None
-            if formato:
-                for cel in ws[letra][1:]:
-                    cel.number_format = formato
-        ws.freeze_panes = "A2"
-        ws.auto_filter.ref = ws.dimensions
-
-    buf = BytesIO()
-    with pd.ExcelWriter(buf, engine="openpyxl") as xw:
-        tabela.to_excel(xw, sheet_name="Lançamentos", index=False)
-        formatar(xw.sheets["Lançamentos"], tabela,
-                 {"Data": 12, "Hora": 8, "Operação": 11, "Frente": 20, "Tipo de Óleo": 14,
-                  "Frota": 40, "Qtd (L)": 10, "Justificativa": 60})
-
-        saidas = tabela[tabela["Operação"] == "Saida"]
-        if not saidas.empty:
-            resumo = saidas.pivot_table(index="Frente", columns="Tipo de Óleo", values="Qtd (L)",
-                                        aggfunc="sum", fill_value=0)
-            resumo = resumo[[t for t in TIPOS_OLEO if t in resumo.columns]]
-            resumo["Total"] = resumo.sum(axis=1)
-            resumo.loc["Total"] = resumo.sum()
-            resumo = resumo.rename(index={"": "Sem frente"}).reset_index()
-            resumo.columns.name = None
-            resumo.to_excel(xw, sheet_name="Resumo saídas", index=False)
-            formatar(xw.sheets["Resumo saídas"], resumo, {"Frente": 22})
-    return buf.getvalue()
+@st.cache_data(ttl=300, show_spinner=False)
+def pdf_do_relatorio(tabela, unidade, data_ini, data_fim, frente, tipo, operacao, saldos):
+    # todo clique refaz a tela; o cache evita remontar o PDF quando dados e filtros não mudaram
+    # (o "Gerado em" pode ficar até 5 min mais antigo)
+    return gerar_pdf(
+        tabela, unidade=unidade, data_ini=data_ini, data_fim=data_fim, frente=frente, tipo=tipo,
+        operacao=operacao, saldos=saldos, tipos_oleo=list(TIPOS_OLEO), agora=datetime.now(TZ_LOCAL),
+        logo=ARQUIVO_LOGO if os.path.exists(ARQUIVO_LOGO) else None,
+    )
 
 
 # ==========================
@@ -769,8 +745,9 @@ with aba3:
             if frente_filtro != "Todas":
                 nome_arquivo += f"_{frente_filtro}"
             st.download_button(
-                "📥  EXPORTAR PARA EXCEL",
-                data=gerar_excel(tabela),
-                file_name=nome_arquivo.replace(" ", "_") + ".xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                "📄  BAIXAR RELATÓRIO EM PDF",
+                data=pdf_do_relatorio(tabela, NOME_UNIDADE, data_ini, data_fim, frente_filtro,
+                                      tipo_filtro, op_filtro, saldos),
+                file_name=nome_arquivo.replace(" ", "_") + ".pdf",
+                mime="application/pdf",
             )
