@@ -4,6 +4,8 @@ import pandas as pd
 from datetime import datetime, timezone, timedelta
 import time
 import os
+import re
+from io import BytesIO
 
 # ==========================
 # CONFIGURAÇÕES
@@ -19,6 +21,17 @@ ARQUIVO_LOGO = "logo_ms.png"
 USUARIOS = st.secrets["usuarios_oleo"]
 
 TZ_LOCAL = timezone(timedelta(hours=-3))  # UTC-3 — Naviraí/MS
+
+# Kanban de frotas (site AppKanbanFrotas): de onde vêm as frotas e a frente de cada uma
+KANBAN_SITE_ID = "metalcana.sharepoint.com,2be24020-04cd-4e9e-99db-567f234e8239,0fc6a566-ec7f-468e-9680-a7b80bfb543a"
+KANBAN_LISTA = "HistoricoFrenteFrotas"
+
+# Centros de custo de cada unidade, pela lista de lançamentos do usuário (lista_id do secrets).
+# Na saída só aparecem as frotas cujo registro mais recente no Kanban é de um desses centros.
+CENTROS_DA_LISTA = {
+    "f9196cb9-aa0f-41b8-9123-3e9dc9d2aaa7": (5,),     # Nova_Produtiva: 005 NOVA PRODUTIVA
+    "3ec9484d-d313-47a8-b68d-29766fd92a5c": (3, 4, 28),   # Vale: 003 IVAICANA, 004 RENUKA e 028 AGRO VALE DO IVAI (colhe no 003/004)
+}
 
 TIPOS_OLEO = {
     "Hidráulico": {
@@ -64,19 +77,26 @@ def obter_token():
 # ==========================
 # FUNÇÕES SHAREPOINT
 # ==========================
-def obter_dados_sharepoint(token, lista_id):
-    url = (
-        f"{GRAPH_URL}/sites/{SITE_ID}/lists/{lista_id}/items"
-        f"?expand=fields&$top=2000"
-    )
+def buscar_itens(token, lista_id, site_id=SITE_ID):
+    # a Graph API devolve a lista em páginas; segue o @odata.nextLink até o fim
+    url = f"{GRAPH_URL}/sites/{site_id}/lists/{lista_id}/items?expand=fields&$top=999"
     headers = {"Authorization": f"Bearer {token}"}
-    try:
+    itens = []
+    while url:
         r = requests.get(url, headers=headers)
-        if not r.ok:
-            st.error(f"Erro Graph API ({r.status_code}): {r.text[:300]}")
-            return []
-        dados = r.json().get("value", [])
-        return [item["fields"] for item in dados]
+        r.raise_for_status()
+        corpo = r.json()
+        itens += [item["fields"] for item in corpo.get("value", [])]
+        url = corpo.get("@odata.nextLink")
+    return itens
+
+
+def obter_dados_sharepoint(token, lista_id):
+    try:
+        return buscar_itens(token, lista_id)
+    except requests.HTTPError as e:
+        st.error(f"Erro Graph API ({e.response.status_code}): {e.response.text[:300]}")
+        return []
     except Exception as e:
         st.error(f"Erro ao buscar dados: {e}")
         return []
@@ -101,24 +121,43 @@ def enviar_dados_sharepoint(token, lista_id, dados):
         return False
 
 
+def normalizar_frente(texto):
+    # grafia antiga do Kanban: "FRENTE 1 - ADEMIR" -> "ADEMIR"
+    if not isinstance(texto, str):
+        return ""
+    t = texto.strip().upper()
+    m = re.match(r"^FRENTE\s.*?\s-\s(.+)$", t)
+    return m.group(1).strip() if m else t
+
+
 @st.cache_data(ttl=300)
-def carregar_frotas(token, lista_frotas_id):
-    url = f"{GRAPH_URL}/sites/{SITE_ID}/lists/{lista_frotas_id}/items?expand=fields&$top=5000"
-    headers = {"Authorization": f"Bearer {token}"}
+def carregar_frotas(_token, centros):
+    """{frota: frente} das frotas cujo registro mais recente no Kanban é de um dos centros de custo.
+
+    O token fica fora da chave do cache (começa com _): ele muda a cada minuto.
+    """
     try:
-        r = requests.get(url, headers=headers)
-        itens = r.json().get("value", [])
-        frotas = [i["fields"]["Title"] for i in itens if "Title" in i["fields"]]
-        return sorted(set(frotas))
+        itens = buscar_itens(_token, KANBAN_LISTA, site_id=KANBAN_SITE_ID)
     except:
-        return []
+        return {}
+    kb = pd.DataFrame(itens)
+    for col in ["Frota", "Frente", "CentroCusto", "DataRegistro", "Created"]:
+        if col not in kb.columns:
+            kb[col] = None
+    kb["Frota"] = kb["Frota"].fillna("").astype(str).str.replace("\xa0", " ").str.strip()
+    kb["num"] = pd.to_numeric(kb["Frota"].str.extract(r"^(\d+)")[0], errors="coerce")
+    kb = kb.dropna(subset=["num"]).sort_values(["DataRegistro", "Created"], na_position="first")
+    atual = kb.groupby("num").tail(1)  # registro mais recente de cada frota
+    cc = pd.to_numeric(atual["CentroCusto"].fillna("").astype(str).str.extract(r"^\s*(\d+)")[0], errors="coerce")
+    atual = atual[cc.isin(centros)].sort_values("num")
+    return {r.Frota: normalizar_frente(r.Frente) for r in atual.itertuples()}
 
 
 # ==========================
 # FUNÇÕES DE DADOS
 # ==========================
 def preparar_dataframe(dados_sp):
-    colunas = ["Tipo_Operacao", "Tipo_Oleo", "Frota", "Quantidade", "Justificativa", "Created"]
+    colunas = ["Tipo_Operacao", "Tipo_Oleo", "Frota", "Frente", "Quantidade", "Justificativa", "Created"]
     if not dados_sp:
         return pd.DataFrame(columns=colunas + ["Data_Dt", "Hora"])
     df = pd.DataFrame(dados_sp)
@@ -133,6 +172,7 @@ def preparar_dataframe(dados_sp):
     # normaliza strings para evitar problemas de espaço/encoding
     df["Tipo_Oleo"]      = df["Tipo_Oleo"].astype(str).str.strip()
     df["Tipo_Operacao"]  = df["Tipo_Operacao"].astype(str).str.strip()
+    df["Frente"]         = df["Frente"].fillna("").astype(str).str.strip()
     return df
 
 
@@ -144,6 +184,42 @@ def calcular_saldos(df):
         sai = df_t[df_t["Tipo_Operacao"].str.strip() == "Saida"]["Quantidade"].sum()
         saldos[tipo] = ent - sai
     return saldos
+
+
+def gerar_excel(tabela):
+    """.xlsx do relatório: aba Lançamentos (a tabela da tela) e aba Resumo saídas (litros por frente e tipo)."""
+    from openpyxl.utils import get_column_letter
+
+    def formatar(ws, df, larguras):
+        for i, col in enumerate(df.columns, start=1):
+            letra = get_column_letter(i)
+            ws.column_dimensions[letra].width = larguras.get(col, 14)
+            formato = "DD/MM/YYYY" if col == "Data" else "#,##0.0" if df[col].dtype.kind in "fi" else None
+            if formato:
+                for cel in ws[letra][1:]:
+                    cel.number_format = formato
+        ws.freeze_panes = "A2"
+        ws.auto_filter.ref = ws.dimensions
+
+    buf = BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as xw:
+        tabela.to_excel(xw, sheet_name="Lançamentos", index=False)
+        formatar(xw.sheets["Lançamentos"], tabela,
+                 {"Data": 12, "Hora": 8, "Operação": 11, "Frente": 20, "Tipo de Óleo": 14,
+                  "Frota": 40, "Qtd (L)": 10, "Justificativa": 60})
+
+        saidas = tabela[tabela["Operação"] == "Saida"]
+        if not saidas.empty:
+            resumo = saidas.pivot_table(index="Frente", columns="Tipo de Óleo", values="Qtd (L)",
+                                        aggfunc="sum", fill_value=0)
+            resumo = resumo[[t for t in TIPOS_OLEO if t in resumo.columns]]
+            resumo["Total"] = resumo.sum(axis=1)
+            resumo.loc["Total"] = resumo.sum()
+            resumo = resumo.rename(index={"": "Sem frente"}).reset_index()
+            resumo.columns.name = None
+            resumo.to_excel(xw, sheet_name="Resumo saídas", index=False)
+            formatar(xw.sheets["Resumo saídas"], resumo, {"Frente": 22})
+    return buf.getvalue()
 
 
 # ==========================
@@ -384,7 +460,6 @@ if not st.session_state["logado"]:
                 st.session_state["logado"] = True
                 st.session_state["usuario"] = usuario
                 st.session_state["lista_id"] = USUARIOS[usuario]["lista_id"]
-                st.session_state["lista_frotas_id"] = USUARIOS[usuario]["lista_frotas_id"]
                 st.session_state["nome"] = USUARIOS[usuario]["nome"]
                 st.rerun()
             else:
@@ -397,7 +472,7 @@ if not st.session_state["logado"]:
 # SISTEMA PRINCIPAL
 # ==========================
 LISTA_ID = st.session_state["lista_id"]
-LISTA_FROTAS_ID = st.session_state["lista_frotas_id"]
+CENTROS = CENTROS_DA_LISTA.get(LISTA_ID.lower(), ())
 NOME_UNIDADE = st.session_state["nome"]
 
 token = obter_token()
@@ -474,17 +549,32 @@ aba1, aba2, aba3 = st.tabs(["🔧  REGISTRAR SAÍDA", "📦  ENTRADA DE ESTOQUE"
 with aba1:
     st.markdown('<div class="section-title">Registrar Consumo / Saída</div>', unsafe_allow_html=True)
 
-    lista_frotas = [""] + carregar_frotas(token, LISTA_FROTAS_ID)
+    frente_da_frota = carregar_frotas(token, CENTROS)
+    if not CENTROS:
+        st.error("Os centros de custo desta unidade não estão configurados (CENTROS_DA_LISTA no código).")
+    elif not frente_da_frota:
+        st.warning(f"Nenhuma frota dos centros {', '.join(f'{c:03d}' for c in CENTROS)} encontrada no Kanban de frotas.")
+    lista_frotas = [""] + list(frente_da_frota)  # já vem em ordem de número de frota
+    lista_frentes = [""] + sorted(set(frente_da_frota.values()) - {""})
 
     if "reset_oleo_counter" not in st.session_state:
         st.session_state["reset_oleo_counter"] = 0
 
-    col_frota, col_tipo = st.columns(2)
+    col_frota, col_frente, col_tipo = st.columns(3)
     with col_frota:
         frota_sel = st.selectbox(
             "Frota",
             lista_frotas,
             key=f"frota_oleo_{st.session_state['reset_oleo_counter']}",
+        )
+    with col_frente:
+        # a key muda com a frota, então a frente volta para a do CADASTRO a cada frota escolhida
+        frente_sel = st.selectbox(
+            "Frente",
+            lista_frentes,
+            index=lista_frentes.index(frente_da_frota.get(frota_sel, "")),
+            key=f"frente_oleo_{st.session_state['reset_oleo_counter']}_{frota_sel}",
+            help="Vem do Kanban de frotas. Troque se a máquina estiver trabalhando em outra frente.",
         )
     with col_tipo:
         tipo_oleo_sel = st.selectbox(
@@ -517,6 +607,8 @@ with aba1:
         if st.form_submit_button("💾  SALVAR SAÍDA", type="primary", use_container_width=True):
             if not frota_sel:
                 st.error("Selecione uma frota válida.")
+            elif not frente_sel:
+                st.error("Selecione a frente.")
             elif not justificativa.strip():
                 st.error("Preencha a justificativa antes de salvar.")
             elif saldo_tipo <= 0:
@@ -530,11 +622,12 @@ with aba1:
                         "Tipo_Operacao": "Saida",
                         "Tipo_Oleo": tipo_oleo_sel,
                         "Frota": frota_sel,
+                        "Frente": frente_sel,
                         "Quantidade": quantidade,
                         "Justificativa": justificativa.strip(),
                     })
                 if ok:
-                    st.success(f"✅ {quantidade:,.1f} L de {tipo_oleo_sel} debitados da frota **{frota_sel}**!")
+                    st.success(f"✅ {quantidade:,.1f} L de {tipo_oleo_sel} debitados da frota **{frota_sel}** (frente {frente_sel})!")
                     time.sleep(1)
                     st.session_state["reset_oleo_counter"] += 1
                     st.rerun()
@@ -586,56 +679,98 @@ with aba2:
 with aba3:
     st.markdown('<div class="section-title">Relatório de Movimentação</div>', unsafe_allow_html=True)
 
-    col_f1, col_f2, col_f3 = st.columns(3)
+    hoje = datetime.now(TZ_LOCAL).date()
+    saidas = df[df["Tipo_Operacao"] == "Saida"]
+    opcoes_frente = ["Todas"] + sorted(set(saidas["Frente"]) - {""})
+    if (saidas["Frente"] == "").any():
+        opcoes_frente.append("Sem frente")
+
+    col_f1, col_f2, col_f3, col_f4, col_f5 = st.columns(5)
     with col_f1:
-        data_filtro = st.date_input("Data", datetime.today())
+        data_ini = st.date_input("Data inicial", hoje.replace(day=1), format="DD/MM/YYYY")
     with col_f2:
-        tipo_filtro = st.selectbox("Tipo de Óleo", ["Todos"] + list(TIPOS_OLEO.keys()))
+        data_fim = st.date_input("Data final", hoje, format="DD/MM/YYYY")
     with col_f3:
+        frente_filtro = st.selectbox("Frente", opcoes_frente)
+    with col_f4:
+        tipo_filtro = st.selectbox("Tipo de Óleo", ["Todos"] + list(TIPOS_OLEO.keys()))
+    with col_f5:
         op_filtro = st.selectbox("Operação", ["Todas", "Saida", "Entrada"])
+
+    if data_ini == data_fim:
+        periodo = data_ini.strftime("%d/%m/%Y")
+    else:
+        periodo = f"{data_ini.strftime('%d/%m/%Y')} a {data_fim.strftime('%d/%m/%Y')}"
 
     if df.empty:
         st.info("Nenhum registro encontrado para esta unidade.")
+    elif data_ini > data_fim:
+        st.warning("A data inicial está depois da data final.")
     else:
-        # resumo do dia
-        st.markdown(f"**Resumo — {data_filtro.strftime('%d/%m/%Y')}**")
+        df_per = df[(df["Data_Dt"] >= data_ini) & (df["Data_Dt"] <= data_fim)]
+        if frente_filtro != "Todas":
+            # entrada é estoque da unidade e não tem frente: com uma frente escolhida, só as saídas dela
+            frente_alvo = "" if frente_filtro == "Sem frente" else frente_filtro
+            df_per = df_per[(df_per["Tipo_Operacao"] == "Saida") & (df_per["Frente"] == frente_alvo)]
+
+        # resumo do período
+        sufixo_frente = "" if frente_filtro == "Todas" else f" · Frente {frente_filtro}"
+        st.markdown(f"**Resumo — {periodo}{sufixo_frente}**")
         cols_res = st.columns(3)
         for i, (tipo, cfg) in enumerate(TIPOS_OLEO.items()):
-            df_t_dia = df[df["Data_Dt"] == data_filtro]
-            ent_dia = df_t_dia[(df_t_dia["Tipo_Oleo"] == tipo) & (df_t_dia["Tipo_Operacao"] == "Entrada")]["Quantidade"].sum()
-            sai_dia = df_t_dia[(df_t_dia["Tipo_Oleo"] == tipo) & (df_t_dia["Tipo_Operacao"] == "Saida")]["Quantidade"].sum()
+            df_t = df_per[df_per["Tipo_Oleo"] == tipo]
+            ent_per = df_t[df_t["Tipo_Operacao"] == "Entrada"]["Quantidade"].sum()
+            sai_per = df_t[df_t["Tipo_Operacao"] == "Saida"]["Quantidade"].sum()
+            linha_ent = (
+                f"<div class='row'><span>⬆️ Entradas</span><b>{ent_per:,.1f} L</b></div>"
+                if frente_filtro == "Todas" else ""
+            )
             with cols_res[i]:
                 st.markdown(
                     f"<div class='resumo-card'>"
                     f"<h4 style='color:{cfg['cor']};'>{cfg['emoji']} {tipo}</h4>"
-                    f"<div class='row'><span>⬆️ Entradas</span><b>{ent_dia:,.1f} L</b></div>"
-                    f"<div class='row'><span>⬇️ Saídas</span><b>{sai_dia:,.1f} L</b></div>"
+                    f"{linha_ent}"
+                    f"<div class='row'><span>⬇️ Saídas</span><b>{sai_per:,.1f} L</b></div>"
                     f"</div>",
                     unsafe_allow_html=True,
                 )
 
         st.markdown("<br>", unsafe_allow_html=True)
 
-        df_rel = df[df["Data_Dt"] == data_filtro].copy()
+        df_rel = df_per.sort_values("Created")
         if tipo_filtro != "Todos":
             df_rel = df_rel[df_rel["Tipo_Oleo"] == tipo_filtro]
         if op_filtro != "Todas":
             df_rel = df_rel[df_rel["Tipo_Operacao"] == op_filtro]
 
         if df_rel.empty:
-            st.info(f"Nenhum registro para os filtros selecionados em {data_filtro.strftime('%d/%m/%Y')}.")
+            st.info(f"Nenhum registro para os filtros selecionados em {periodo}.")
         else:
-            colunas_exibir = [c for c in ["Hora", "Tipo_Operacao", "Tipo_Oleo", "Frota", "Quantidade", "Justificativa"] if c in df_rel.columns]
+            colunas_exibir = [c for c in ["Data_Dt", "Hora", "Tipo_Operacao", "Frente", "Tipo_Oleo", "Frota", "Quantidade", "Justificativa"] if c in df_rel.columns]
+            tabela = df_rel[colunas_exibir].rename(columns={
+                "Data_Dt": "Data",
+                "Hora": "Hora",
+                "Tipo_Operacao": "Operação",
+                "Frente": "Frente",
+                "Tipo_Oleo": "Tipo de Óleo",
+                "Frota": "Frota",
+                "Quantidade": "Qtd (L)",
+                "Justificativa": "Justificativa",
+            })
             st.dataframe(
-                df_rel[colunas_exibir].rename(columns={
-                    "Hora": "Hora",
-                    "Tipo_Operacao": "Operação",
-                    "Tipo_Oleo": "Tipo de Óleo",
-                    "Frota": "Frota",
-                    "Quantidade": "Qtd (L)",
-                    "Justificativa": "Justificativa",
-                }),
+                tabela,
+                column_config={"Data": st.column_config.DateColumn(format="DD/MM/YYYY")},
                 use_container_width=True,
                 hide_index=True,
             )
             st.caption(f"{len(df_rel)} registro(s) encontrado(s)")
+
+            nome_arquivo = f"Oleo_{NOME_UNIDADE}_{data_ini.strftime('%d-%m-%Y')}_a_{data_fim.strftime('%d-%m-%Y')}"
+            if frente_filtro != "Todas":
+                nome_arquivo += f"_{frente_filtro}"
+            st.download_button(
+                "📥  EXPORTAR PARA EXCEL",
+                data=gerar_excel(tabela),
+                file_name=nome_arquivo.replace(" ", "_") + ".xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
